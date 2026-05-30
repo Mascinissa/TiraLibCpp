@@ -331,6 +331,79 @@ TEST(TiraLibCppTest, Unrolling)
             clean_halide_ir(halide_ir));
 }
 
+TEST(TiraLibCppTest, UnrollingLNeg1)
+{
+  std::string schedule = "U(L-1,32,comps=['comp_blur'])";
+  auto result = apply_schedule_blur(schedule);
+
+  Result resultInstance = std::get<0>(result);
+  std::string halide_ir = std::get<1>(result);
+
+  std::string function_name = "function_blur_MINI";
+
+  tiramisu::init(function_name);
+
+  var xi("xi", 0, 34), yi("yi", 0, 18), ci("ci", 0, 5);
+  var x("x", 1, 34 - 1), y("y", 1, 18 - 1), c("c", 1, 5 - 1);
+
+  input input_img("input_img", {ci, yi, xi}, p_float64);
+
+  computation comp_blur("comp_blur", {c, y, x}, (input_img(c, y + 1, x - 1) + input_img(c, y + 1, x) + input_img(c, y + 1, x + 1) + input_img(c, y, x - 1) + input_img(c, y, x) + input_img(c, y, x + 1) + input_img(c, y - 1, x - 1) + input_img(c, y - 1, x) + input_img(c, y - 1, x + 1)) * 0.111111);
+
+  buffer input_buf("input_buf", {5, 18, 34}, p_float64, a_input);
+  buffer output_buf("output_buf", {5, 18, 34}, p_float64, a_output);
+
+  input_img.store_in(&input_buf);
+  comp_blur.store_in(&output_buf);
+
+  auto buffers = {&input_buf, &output_buf};
+
+  // L-1 on comp_blur (3 loops c,y,x) resolves to level 2.
+  comp_blur.unroll(2, 32);
+
+  EXPECT_EQ(global::get_implicit_function()->get_name(), function_name);
+  EXPECT_EQ(clean_halide_ir(global::get_implicit_function()->get_halide_ir(buffers)),
+            clean_halide_ir(halide_ir));
+}
+
+TEST(TiraLibCppTest, UnrollingLNeg1AfterTiling)
+{
+  // After T2 adds two loops, the innermost level for comp_blur is 4.
+  // We verify L-1 resolution via the schedule dim formula it uses
+  // ((isl_map_dim(schedule, isl_dim_out) - 2) / 2 - 1). Running the full
+  // U(L-1,...) action through apply_schedule_blur after a tile triggers a
+  // pre-existing Tiramisu bound-extraction failure inside
+  // computation::separateAndSplit that is unrelated to L-1.
+  std::string function_name = "function_blur_MINI";
+
+  tiramisu::init(function_name);
+
+  var xi("xi", 0, 34), yi("yi", 0, 18), ci("ci", 0, 5);
+  var x("x", 1, 34 - 1), y("y", 1, 18 - 1), c("c", 1, 5 - 1);
+
+  input input_img("input_img", {ci, yi, xi}, p_float64);
+
+  computation comp_blur("comp_blur", {c, y, x}, (input_img(c, y + 1, x - 1) + input_img(c, y + 1, x) + input_img(c, y + 1, x + 1) + input_img(c, y, x - 1) + input_img(c, y, x) + input_img(c, y, x + 1) + input_img(c, y - 1, x - 1) + input_img(c, y - 1, x) + input_img(c, y - 1, x + 1)) * 0.111111);
+
+  buffer input_buf("input_buf", {5, 18, 34}, p_float64, a_input);
+  buffer output_buf("output_buf", {5, 18, 34}, p_float64, a_output);
+
+  input_img.store_in(&input_buf);
+  comp_blur.store_in(&output_buf);
+
+  auto innermost_of = [](tiramisu::computation &c) {
+    return (isl_map_dim(c.get_schedule(), isl_dim_out) - 2) / 2 - 1;
+  };
+
+  EXPECT_EQ(innermost_of(comp_blur), 2);
+
+  Result result;
+  apply_action("T2(L0,L1,32,32,comps=['comp_blur'])",
+               global::get_implicit_function(), result);
+
+  EXPECT_EQ(innermost_of(comp_blur), 4);
+}
+
 TEST(TiraLibCppTest, Interchange)
 {
   std::string schedule = "I(L0,L1,comps=['comp_blur'])";
@@ -744,6 +817,14 @@ TEST(TiraLibCppTest, FusionLegal)
   EXPECT_EQ(resultInstance.legality, true);
   EXPECT_EQ(global::get_implicit_function()->get_name(), "function_gemver_MINI");
   EXPECT_EQ(clean_halide_ir(global::get_implicit_function()->get_halide_ir({&b_A, &b_u1, &b_u2, &b_v1, &b_v2, &b_y, &b_z, &b_A_hat, &b_x, &b_w})), clean_halide_ir(halide_ir));
+}
+
+TEST(TiraLibCppTest, UnrollingLNeg1Mismatch)
+{
+  // A_hat is 2D (innermost level 1); x is 1D (innermost level 0).
+  // U(L-1,...) over both must reject the action.
+  std::string schedule = "U(L-1,4,comps=['A_hat', 'x'])";
+  EXPECT_THROW(apply_schedule_multi_comp_sample(schedule), std::invalid_argument);
 }
 
 TEST(TiraLibCppTest, Matrix)

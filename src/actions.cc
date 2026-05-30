@@ -28,7 +28,7 @@ bool apply_action(std::string action_str, tiramisu::function *implicit_function,
     }
     case 'U':
     {
-        std::string regex_str = "U\\(L(\\d),(\\d+),comps=\\[([\\w', ]*)\\]\\)";
+        std::string regex_str = "U\\(L(-?\\d+),(\\d+),comps=\\[([\\w', ]*)\\]\\)";
         std::regex re(regex_str);
         std::smatch match;
         std::regex_search(action_str, match, re);
@@ -38,7 +38,45 @@ bool apply_action(std::string action_str, tiramisu::function *implicit_function,
         comps_str.erase(std::remove_if(comps_str.begin(), comps_str.end(), isSingleQuoteOrWhiteSpace), comps_str.end());
         auto comps = get_comps(comps_str, implicit_function);
 
+        if (level == -1)
+        {
+            // Resolve "innermost loop" against the current schedule, which
+            // reflects previously applied actions (e.g. tile). Cross-comp
+            // mismatch is detected via the iteration domain (untouched by
+            // align_schedules' padding) so we catch the gemver-style case
+            // where A_hat is 2D and x is 1D even if their schedules have
+            // already been padded to a common width by an earlier
+            // prepare_schedules_for_legality_checks().
+            // Schedule layout is [0, 0, i1, 0, i2, 0, ...]
+            // (see loop_level_into_dynamic_dimension in tiramisu_core.cpp);
+            // loop count = (out_dims - 2) / 2.
+            if (comps.empty())
+            {
+                throw std::invalid_argument(
+                    "U(L-1,...): no computations to unroll");
+            }
+            auto iter_dim_of = [](tiramisu::computation *c) {
+                return isl_set_dim(c->get_iteration_domain(), isl_dim_set);
+            };
+            int reference_iter_dim = iter_dim_of(comps.front());
+            for (auto comp : comps)
+            {
+                if (iter_dim_of(comp) != reference_iter_dim)
+                {
+                    throw std::invalid_argument(
+                        "U(L-1,...) requires all target computations to "
+                        "share the same innermost loop depth. Split "
+                        "non-perfectly-nested computations into separate "
+                        "U(...) actions.");
+                }
+            }
+            int sched_dims =
+                isl_map_dim(comps.front()->get_schedule(), isl_dim_out);
+            level = (sched_dims - 2) / 2 - 1;
+        }
+
         tiramisu::prepare_schedules_for_legality_checks(true);
+
         is_legal = loop_unrolling_is_legal(level, comps);
 
         for (auto comp : comps)
