@@ -334,6 +334,14 @@ bool apply_action(std::string action_str, tiramisu::function *implicit_function,
 
 bool apply_actions_from_schedule_str(std::string schedule_str, tiramisu::function *implicit_function, Result &result)
 {
+    // Normalize: drop all whitespace and canonicalize quotes so the
+    // per-action regexes can stay strict. Tiramisu identifiers are \w+,
+    // so stripping whitespace inside the schedule string is lossless.
+    schedule_str.erase(std::remove_if(schedule_str.begin(), schedule_str.end(),
+                                      [](unsigned char c) { return std::isspace(c); }),
+                       schedule_str.end());
+    std::replace(schedule_str.begin(), schedule_str.end(), '"', '\'');
+
     std::string delimiter = "|";
     size_t pos = 0;
     std::string token;
