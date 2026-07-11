@@ -94,6 +94,22 @@ bool apply_action(std::string action_str, tiramisu::function *implicit_function,
         {
             comp->unroll(level, factor);
         }
+
+        // Unrolling splits the shared loop of each computation independently,
+        // which fissions computations that were fused into one loop each. The
+        // LOOPer autoscheduler re-establishes the intended fusion afterwards
+        // (via order_computations_from_ast). Replicate that for the unrolled
+        // group: re-issue the .after() ordering at their (now deeper) innermost
+        // loop level so codegen keeps them fused. Without this, a subset-unroll
+        // of mutually dependent computations (e.g. deriche's recursive filter)
+        // is distributed and produces wrong results.
+        if (comps.size() > 1)
+        {
+            int sched_dims = isl_map_dim(comps.front()->get_schedule(), isl_dim_out);
+            int innermost_level = (sched_dims - 2) / 2 - 1;
+            for (size_t i = 1; i < comps.size(); i++)
+                comps[i]->after(*comps[i - 1], innermost_level);
+        }
         break;
     }
     case 'I':
