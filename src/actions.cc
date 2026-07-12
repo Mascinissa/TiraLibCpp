@@ -408,6 +408,9 @@ Result schedule_str_to_result(std::string function_name, std::string schedule_st
 
     tiramisu::prepare_schedules_for_legality_checks();
     is_legal &= tiramisu::check_legality_of_function();
+    // Re-verify parallelization on the final schedule: a parallel tag applied
+    // earlier may have been invalidated by a later interchange/tiling.
+    is_legal &= tiramisu::check_legality_of_parallelism();
     result.legality = is_legal;
     implicit_function->gen_time_space_domain();
     implicit_function->gen_isl_ast();
