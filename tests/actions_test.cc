@@ -67,6 +67,45 @@ std::string clean_halide_ir(std::string ir)
   return result2;
 }
 
+std::tuple<Result, std::string> apply_schedule_parallel_group(std::string schedule)
+{
+  std::string function_name = "function_parallel_group";
+  tiramisu::init(function_name);
+
+  var i("i", 0, 16);
+  computation first("first", {i}, 1);
+  computation second("second", {i}, 2);
+  computation third("third", {i}, 3);
+
+  // first and second share one loop; third is in a separate root loop.
+  first.then(second, i).then(third, computation::root_dimension);
+
+  buffer b_first("b_first", {16}, p_int32, a_output);
+  buffer b_second("b_second", {16}, p_int32, a_output);
+  buffer b_third("b_third", {16}, p_int32, a_output);
+  first.store_in(&b_first);
+  second.store_in(&b_second);
+  third.store_in(&b_third);
+
+  std::vector<buffer *> buffers = {&b_first, &b_second, &b_third};
+  auto result = schedule_str_to_result(
+      function_name, schedule, Operation::legality, buffers);
+  auto halide_ir = global::get_implicit_function()->get_halide_ir(buffers);
+  return std::make_tuple(result, halide_ir);
+}
+
+size_t count_occurrences(const std::string &text, const std::string &needle)
+{
+  size_t count = 0;
+  size_t position = 0;
+  while ((position = text.find(needle, position)) != std::string::npos)
+  {
+    count++;
+    position += needle.size();
+  }
+  return count;
+}
+
 // Demonstrate some basic assertions.
 TEST(TiraLibCppTest, ParallelizationCheck)
 {
@@ -170,6 +209,28 @@ TEST(TiraLibCppTest, ParallelizationCheckL1)
 
   EXPECT_EQ(global::get_implicit_function()->get_name(), function_name);
   EXPECT_EQ(clean_halide_ir(global::get_implicit_function()->get_halide_ir(buffers)), clean_halide_ir(halide_ir));
+}
+
+TEST(TiraLibCppTest, ParallelizationTagsFusedAndIndependentLoops)
+{
+  auto [result, halide_ir] = apply_schedule_parallel_group(
+      "P(L0,comps=['first','second','third'])");
+
+  EXPECT_TRUE(result.legality);
+  // first and second share one parallel loop, while third has its own.
+  EXPECT_EQ(count_occurrences(halide_ir, "parallel ("), 2);
+}
+
+TEST(TiraLibCppTest, DuplicateParallelizationTargetsAreIdempotent)
+{
+  auto [unique_result, unique_ir] = apply_schedule_parallel_group(
+      "P(L0,comps=['first','second','third'])");
+  auto [duplicate_result, duplicate_ir] = apply_schedule_parallel_group(
+      "P(L0,comps=['first','second','second','third','first'])");
+
+  EXPECT_TRUE(unique_result.legality);
+  EXPECT_TRUE(duplicate_result.legality);
+  EXPECT_EQ(clean_halide_ir(duplicate_ir), clean_halide_ir(unique_ir));
 }
 
 TEST(TiraLibCppTest, Tiling2D)

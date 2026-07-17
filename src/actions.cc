@@ -1,6 +1,7 @@
 #include <tiramisu/tiramisu.h>
 #include <string>
 #include <regex>
+#include <unordered_set>
 #include <TiraLibCPP/utils.h>
 #include <TiraLibCPP/dbhelpers.h>
 
@@ -29,12 +30,20 @@ bool apply_action(std::string action_str, tiramisu::function *implicit_function,
         int level = std::stoi(match[1]);
         std::string comps_str = match[2];
         comps_str.erase(std::remove_if(comps_str.begin(), comps_str.end(), isSingleQuoteOrWhiteSpace), comps_str.end());
-        auto comps = get_comps(comps_str, implicit_function);
+        auto parsed_comps = get_comps(comps_str, implicit_function);
+        std::vector<tiramisu::computation *> comps;
+        std::unordered_set<tiramisu::computation *> seen;
+        for (auto comp : parsed_comps)
+        {
+            if (seen.insert(comp).second)
+                comps.push_back(comp);
+        }
 
         tiramisu::prepare_schedules_for_legality_checks(true);
         is_legal = tiramisu::loop_parallelization_is_legal(level, comps);
 
-        comps[0]->tag_parallel_level(level);
+        for (auto comp : comps)
+            comp->tag_parallel_level(level);
         break;
     }
     case 'U':
