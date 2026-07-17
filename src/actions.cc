@@ -147,18 +147,30 @@ bool apply_action(std::string action_str, tiramisu::function *implicit_function,
     }
     case 'S':
     {
-        std::string regex_str = "S\\(L(\\d),L(\\d),(-?\\d+),(-?\\d+),comps=\\[([\\w', ]*)\\]\\)";
-        std::regex re(regex_str);
+        // For [i', j']^T = [[alpha, beta], [gamma, sigma]] [i, j]^T,
+        // the four-factor form supplies the complete matrix in row-major order.
+        // The legacy two-factor form supplies alpha and beta; Tiramisu computes
+        // gamma and sigma such that alpha * sigma - beta * gamma = 1.
+        std::regex four_factor_re(
+            "S\\(L(\\d),L(\\d),(-?\\d+),(-?\\d+),(-?\\d+),(-?\\d+),comps=\\[([\\w', ]*)\\]\\)");
+        std::regex two_factor_re(
+            "S\\(L(\\d),L(\\d),(-?\\d+),(-?\\d+),comps=\\[([\\w', ]*)\\]\\)");
         std::smatch match;
-        parse_or_throw(action_str, match, re);
+        bool has_four_factors = std::regex_search(action_str, match, four_factor_re);
+        if (!has_four_factors)
+        {
+            parse_or_throw(action_str, match, two_factor_re);
+        }
         int level1 = std::stoi(match[1]);
         int level2 = std::stoi(match[2]);
         int factor1 = std::stoi(match[3]);
         int factor2 = std::stoi(match[4]);
-        std::string comps_str = match[5];
+        int factor3 = has_four_factors ? std::stoi(match[5]) : 0;
+        int factor4 = has_four_factors ? std::stoi(match[6]) : 0;
+        std::string comps_str = match[has_four_factors ? 7 : 5];
         comps_str.erase(std::remove_if(comps_str.begin(), comps_str.end(), isSingleQuoteOrWhiteSpace), comps_str.end());
         auto comps = get_comps(comps_str, implicit_function);
-        if (factor1 == 0 && factor2 == 0)
+        if (!has_four_factors && factor1 == 0 && factor2 == 0)
         {
             auto auto_skewing_result = implicit_function->skewing_local_solver(comps, level1, level2, 1);
 
@@ -188,9 +200,20 @@ bool apply_action(std::string action_str, tiramisu::function *implicit_function,
         if (is_legal)
         {
             result.additional_info = "skewing_factors:" + std::to_string(factor1) + "," + std::to_string(factor2);
+            if (has_four_factors)
+            {
+                result.additional_info += "," + std::to_string(factor3) + "," + std::to_string(factor4);
+            }
             for (auto comp : comps)
             {
-                comp->skew(level1, level2, factor1, factor2);
+                if (has_four_factors)
+                {
+                    comp->skew(level1, level2, factor1, factor2, factor3, factor4);
+                }
+                else
+                {
+                    comp->skew(level1, level2, factor1, factor2);
+                }
             }
         }
 

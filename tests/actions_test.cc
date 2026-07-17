@@ -579,6 +579,34 @@ TEST(TiraLibCppTest, Skewing)
   EXPECT_EQ(clean_halide_ir(global::get_implicit_function()->get_halide_ir({&buf00, &buf01})), clean_halide_ir(halide_ir));
 }
 
+TEST(TiraLibCppTest, SkewingFourFactors)
+{
+  std::string schedule = "S(L0,L1,1,0,1,1,comps=['comp00'])";
+  auto result = apply_schedule_skewing_sample(schedule);
+
+  Result resultInstance = std::get<0>(result);
+  std::string halide_ir = std::get<1>(result);
+
+  tiramisu::init("function550013");
+  var i0("i0", 1, 2049), i1("i1", 1, 2049), i2("i2", 0, 256), i1_p1("i1_p1", 0, 2050), i0_p1("i0_p1", 0, 2050);
+  input icomp00("icomp00", {i0_p1, i1_p1}, p_float64);
+  input input01("input01", {i0_p1}, p_float64);
+  computation comp00("comp00", {i0, i1, i2}, p_float64);
+  comp00.set_expression(icomp00(i0, i1) + icomp00(i0, i1 - 1) * icomp00(i0 + 1, i1) + icomp00(i0, i1 + 1) + icomp00(i0 - 1, i1) + input01(i0) + input01(i0 - 1) - input01(i0 + 1));
+  buffer buf00("buf00", {2050, 2050}, p_float64, a_output);
+  buffer buf01("buf01", {2050}, p_float64, a_input);
+  icomp00.store_in(&buf00);
+  input01.store_in(&buf01);
+  comp00.store_in(&buf00, {i0, i1});
+
+  comp00.skew(0, 1, 1, 0, 1, 1);
+
+  EXPECT_EQ(resultInstance.legality, true);
+  EXPECT_EQ(resultInstance.additional_info, "skewing_factors:1,0,1,1");
+  EXPECT_EQ(global::get_implicit_function()->get_name(), "function550013");
+  EXPECT_EQ(clean_halide_ir(global::get_implicit_function()->get_halide_ir({&buf00, &buf01})), clean_halide_ir(halide_ir));
+}
+
 std::tuple<Result, std::string> apply_schedule_multi_comp_sample(std::string schedule)
 {
   auto function_name = "function_gemver_MINI";
