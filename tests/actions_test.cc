@@ -392,6 +392,17 @@ TEST(TiraLibCppTest, Unrolling)
             clean_halide_ir(halide_ir));
 }
 
+TEST(TiraLibCppTest, UnrollingCheckOnly)
+{
+  auto [result, halide_ir] =
+      apply_schedule_blur("UCheck(L2,32,comps=['comp_blur'])");
+
+  EXPECT_TRUE(result.legality);
+  EXPECT_EQ(halide_ir.find("unrolled"), std::string::npos);
+  EXPECT_EQ(get_operation_from_string("execution_no_check"),
+            Operation::execution_no_check);
+}
+
 TEST(TiraLibCppTest, UnrollingLNeg1)
 {
   std::string schedule = "U(L-1,32,comps=['comp_blur'])";

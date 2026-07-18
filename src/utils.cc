@@ -68,6 +68,8 @@ Operation get_operation_from_string(std::string operation_str)
         return Operation::execution;
     else if (operation_str == "annotations")
         return Operation::annotations;
+    else if (operation_str == "execution_no_check")
+        return Operation::execution_no_check;
     else
         assert(false && "Unknown operation");
 }

@@ -48,7 +48,10 @@ bool apply_action(std::string action_str, tiramisu::function *implicit_function,
     }
     case 'U':
     {
-        std::string regex_str = "U\\(L(-?\\d+),(\\d+),comps=\\[([\\w', ]*)\\]\\)";
+        bool check_only = action_str.rfind("UCheck(", 0) == 0;
+        std::string regex_str = check_only
+            ? "UCheck\\(L(-?\\d+),(\\d+),comps=\\[([\\w', ]*)\\]\\)"
+            : "U\\(L(-?\\d+),(\\d+),comps=\\[([\\w', ]*)\\]\\)";
         std::regex re(regex_str);
         std::smatch match;
         parse_or_throw(action_str, match, re);
@@ -98,6 +101,9 @@ bool apply_action(std::string action_str, tiramisu::function *implicit_function,
         tiramisu::prepare_schedules_for_legality_checks(true);
 
         is_legal = loop_unrolling_is_legal(level, comps);
+
+        if (check_only)
+            break;
 
         for (auto comp : comps)
         {
@@ -449,7 +455,10 @@ Result schedule_str_to_result(std::string function_name, std::string schedule_st
     std::string isl_ast = implicit_function->generate_isl_ast_representation_string(nullptr, 0, "");
     result.isl_ast = isl_ast;
 
-    if (is_legal && operation == Operation::execution)
+    bool should_execute = operation == Operation::execution ||
+                          operation == Operation::execution_no_check;
+    bool legality_required = operation != Operation::execution_no_check;
+    if (should_execute && (is_legal || !legality_required))
     {
         tiramisu::codegen(buffers, function_name + ".o");
 
