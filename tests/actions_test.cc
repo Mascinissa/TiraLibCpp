@@ -67,6 +67,45 @@ std::string clean_halide_ir(std::string ir)
   return result2;
 }
 
+std::tuple<Result, std::string> apply_schedule_parallel_group(std::string schedule)
+{
+  std::string function_name = "function_parallel_group";
+  tiramisu::init(function_name);
+
+  var i("i", 0, 16);
+  computation first("first", {i}, 1);
+  computation second("second", {i}, 2);
+  computation third("third", {i}, 3);
+
+  // first and second share one loop; third is in a separate root loop.
+  first.then(second, i).then(third, computation::root_dimension);
+
+  buffer b_first("b_first", {16}, p_int32, a_output);
+  buffer b_second("b_second", {16}, p_int32, a_output);
+  buffer b_third("b_third", {16}, p_int32, a_output);
+  first.store_in(&b_first);
+  second.store_in(&b_second);
+  third.store_in(&b_third);
+
+  std::vector<buffer *> buffers = {&b_first, &b_second, &b_third};
+  auto result = schedule_str_to_result(
+      function_name, schedule, Operation::legality, buffers);
+  auto halide_ir = global::get_implicit_function()->get_halide_ir(buffers);
+  return std::make_tuple(result, halide_ir);
+}
+
+size_t count_occurrences(const std::string &text, const std::string &needle)
+{
+  size_t count = 0;
+  size_t position = 0;
+  while ((position = text.find(needle, position)) != std::string::npos)
+  {
+    count++;
+    position += needle.size();
+  }
+  return count;
+}
+
 // Demonstrate some basic assertions.
 TEST(TiraLibCppTest, ParallelizationCheck)
 {
@@ -170,6 +209,28 @@ TEST(TiraLibCppTest, ParallelizationCheckL1)
 
   EXPECT_EQ(global::get_implicit_function()->get_name(), function_name);
   EXPECT_EQ(clean_halide_ir(global::get_implicit_function()->get_halide_ir(buffers)), clean_halide_ir(halide_ir));
+}
+
+TEST(TiraLibCppTest, ParallelizationTagsFusedAndIndependentLoops)
+{
+  auto [result, halide_ir] = apply_schedule_parallel_group(
+      "P(L0,comps=['first','second','third'])");
+
+  EXPECT_TRUE(result.legality);
+  // first and second share one parallel loop, while third has its own.
+  EXPECT_EQ(count_occurrences(halide_ir, "parallel ("), 2);
+}
+
+TEST(TiraLibCppTest, DuplicateParallelizationTargetsAreIdempotent)
+{
+  auto [unique_result, unique_ir] = apply_schedule_parallel_group(
+      "P(L0,comps=['first','second','third'])");
+  auto [duplicate_result, duplicate_ir] = apply_schedule_parallel_group(
+      "P(L0,comps=['first','second','second','third','first'])");
+
+  EXPECT_TRUE(unique_result.legality);
+  EXPECT_TRUE(duplicate_result.legality);
+  EXPECT_EQ(clean_halide_ir(duplicate_ir), clean_halide_ir(unique_ir));
 }
 
 TEST(TiraLibCppTest, Tiling2D)
@@ -329,6 +390,17 @@ TEST(TiraLibCppTest, Unrolling)
   EXPECT_EQ(global::get_implicit_function()->get_name(), function_name);
   EXPECT_EQ(clean_halide_ir(global::get_implicit_function()->get_halide_ir(buffers)),
             clean_halide_ir(halide_ir));
+}
+
+TEST(TiraLibCppTest, UnrollingCheckOnly)
+{
+  auto [result, halide_ir] =
+      apply_schedule_blur("UCheck(L2,32,comps=['comp_blur'])");
+
+  EXPECT_TRUE(result.legality);
+  EXPECT_EQ(halide_ir.find("unrolled"), std::string::npos);
+  EXPECT_EQ(get_operation_from_string("execution_no_check"),
+            Operation::execution_no_check);
 }
 
 TEST(TiraLibCppTest, UnrollingLNeg1)
@@ -575,6 +647,34 @@ TEST(TiraLibCppTest, Skewing)
 
   comp00.skew(0, 1, 1, 1);
 
+  EXPECT_EQ(global::get_implicit_function()->get_name(), "function550013");
+  EXPECT_EQ(clean_halide_ir(global::get_implicit_function()->get_halide_ir({&buf00, &buf01})), clean_halide_ir(halide_ir));
+}
+
+TEST(TiraLibCppTest, SkewingFourFactors)
+{
+  std::string schedule = "S(L0,L1,1,0,1,1,comps=['comp00'])";
+  auto result = apply_schedule_skewing_sample(schedule);
+
+  Result resultInstance = std::get<0>(result);
+  std::string halide_ir = std::get<1>(result);
+
+  tiramisu::init("function550013");
+  var i0("i0", 1, 2049), i1("i1", 1, 2049), i2("i2", 0, 256), i1_p1("i1_p1", 0, 2050), i0_p1("i0_p1", 0, 2050);
+  input icomp00("icomp00", {i0_p1, i1_p1}, p_float64);
+  input input01("input01", {i0_p1}, p_float64);
+  computation comp00("comp00", {i0, i1, i2}, p_float64);
+  comp00.set_expression(icomp00(i0, i1) + icomp00(i0, i1 - 1) * icomp00(i0 + 1, i1) + icomp00(i0, i1 + 1) + icomp00(i0 - 1, i1) + input01(i0) + input01(i0 - 1) - input01(i0 + 1));
+  buffer buf00("buf00", {2050, 2050}, p_float64, a_output);
+  buffer buf01("buf01", {2050}, p_float64, a_input);
+  icomp00.store_in(&buf00);
+  input01.store_in(&buf01);
+  comp00.store_in(&buf00, {i0, i1});
+
+  comp00.skew(0, 1, 1, 0, 1, 1);
+
+  EXPECT_EQ(resultInstance.legality, true);
+  EXPECT_EQ(resultInstance.additional_info, "skewing_factors:1,0,1,1");
   EXPECT_EQ(global::get_implicit_function()->get_name(), "function550013");
   EXPECT_EQ(clean_halide_ir(global::get_implicit_function()->get_halide_ir({&buf00, &buf01})), clean_halide_ir(halide_ir));
 }

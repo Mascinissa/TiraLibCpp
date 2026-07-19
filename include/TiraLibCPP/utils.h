@@ -18,6 +18,7 @@ enum Operation
     execution = 1,
     annotations = 2,
     skewing_solver = 3,
+    execution_no_check = 4,
 };
 
 struct Result

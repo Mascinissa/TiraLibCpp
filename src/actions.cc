@@ -1,6 +1,7 @@
 #include <tiramisu/tiramisu.h>
 #include <string>
 #include <regex>
+#include <unordered_set>
 #include <TiraLibCPP/utils.h>
 #include <TiraLibCPP/dbhelpers.h>
 
@@ -29,17 +30,28 @@ bool apply_action(std::string action_str, tiramisu::function *implicit_function,
         int level = std::stoi(match[1]);
         std::string comps_str = match[2];
         comps_str.erase(std::remove_if(comps_str.begin(), comps_str.end(), isSingleQuoteOrWhiteSpace), comps_str.end());
-        auto comps = get_comps(comps_str, implicit_function);
+        auto parsed_comps = get_comps(comps_str, implicit_function);
+        std::vector<tiramisu::computation *> comps;
+        std::unordered_set<tiramisu::computation *> seen;
+        for (auto comp : parsed_comps)
+        {
+            if (seen.insert(comp).second)
+                comps.push_back(comp);
+        }
 
         tiramisu::prepare_schedules_for_legality_checks(true);
         is_legal = tiramisu::loop_parallelization_is_legal(level, comps);
 
-        comps[0]->tag_parallel_level(level);
+        for (auto comp : comps)
+            comp->tag_parallel_level(level);
         break;
     }
     case 'U':
     {
-        std::string regex_str = "U\\(L(-?\\d+),(\\d+),comps=\\[([\\w', ]*)\\]\\)";
+        bool check_only = action_str.rfind("UCheck(", 0) == 0;
+        std::string regex_str = check_only
+            ? "UCheck\\(L(-?\\d+),(\\d+),comps=\\[([\\w', ]*)\\]\\)"
+            : "U\\(L(-?\\d+),(\\d+),comps=\\[([\\w', ]*)\\]\\)";
         std::regex re(regex_str);
         std::smatch match;
         parse_or_throw(action_str, match, re);
@@ -90,9 +102,28 @@ bool apply_action(std::string action_str, tiramisu::function *implicit_function,
 
         is_legal = loop_unrolling_is_legal(level, comps);
 
+        if (check_only)
+            break;
+
         for (auto comp : comps)
         {
             comp->unroll(level, factor);
+        }
+
+        // Unrolling splits the shared loop of each computation independently,
+        // which fissions computations that were fused into one loop each. The
+        // LOOPer autoscheduler re-establishes the intended fusion afterwards
+        // (via order_computations_from_ast). Replicate that for the unrolled
+        // group: re-issue the .after() ordering at their (now deeper) innermost
+        // loop level so codegen keeps them fused. Without this, a subset-unroll
+        // of mutually dependent computations (e.g. deriche's recursive filter)
+        // is distributed and produces wrong results.
+        if (comps.size() > 1)
+        {
+            int sched_dims = isl_map_dim(comps.front()->get_schedule(), isl_dim_out);
+            int innermost_level = (sched_dims - 2) / 2 - 1;
+            for (size_t i = 1; i < comps.size(); i++)
+                comps[i]->after(*comps[i - 1], innermost_level);
         }
         break;
     }
@@ -131,18 +162,30 @@ bool apply_action(std::string action_str, tiramisu::function *implicit_function,
     }
     case 'S':
     {
-        std::string regex_str = "S\\(L(\\d),L(\\d),(-?\\d+),(-?\\d+),comps=\\[([\\w', ]*)\\]\\)";
-        std::regex re(regex_str);
+        // For [i', j']^T = [[alpha, beta], [gamma, sigma]] [i, j]^T,
+        // the four-factor form supplies the complete matrix in row-major order.
+        // The legacy two-factor form supplies alpha and beta; Tiramisu computes
+        // gamma and sigma such that alpha * sigma - beta * gamma = 1.
+        std::regex four_factor_re(
+            "S\\(L(\\d),L(\\d),(-?\\d+),(-?\\d+),(-?\\d+),(-?\\d+),comps=\\[([\\w', ]*)\\]\\)");
+        std::regex two_factor_re(
+            "S\\(L(\\d),L(\\d),(-?\\d+),(-?\\d+),comps=\\[([\\w', ]*)\\]\\)");
         std::smatch match;
-        parse_or_throw(action_str, match, re);
+        bool has_four_factors = std::regex_search(action_str, match, four_factor_re);
+        if (!has_four_factors)
+        {
+            parse_or_throw(action_str, match, two_factor_re);
+        }
         int level1 = std::stoi(match[1]);
         int level2 = std::stoi(match[2]);
         int factor1 = std::stoi(match[3]);
         int factor2 = std::stoi(match[4]);
-        std::string comps_str = match[5];
+        int factor3 = has_four_factors ? std::stoi(match[5]) : 0;
+        int factor4 = has_four_factors ? std::stoi(match[6]) : 0;
+        std::string comps_str = match[has_four_factors ? 7 : 5];
         comps_str.erase(std::remove_if(comps_str.begin(), comps_str.end(), isSingleQuoteOrWhiteSpace), comps_str.end());
         auto comps = get_comps(comps_str, implicit_function);
-        if (factor1 == 0 && factor2 == 0)
+        if (!has_four_factors && factor1 == 0 && factor2 == 0)
         {
             auto auto_skewing_result = implicit_function->skewing_local_solver(comps, level1, level2, 1);
 
@@ -172,9 +215,20 @@ bool apply_action(std::string action_str, tiramisu::function *implicit_function,
         if (is_legal)
         {
             result.additional_info = "skewing_factors:" + std::to_string(factor1) + "," + std::to_string(factor2);
+            if (has_four_factors)
+            {
+                result.additional_info += "," + std::to_string(factor3) + "," + std::to_string(factor4);
+            }
             for (auto comp : comps)
             {
-                comp->skew(level1, level2, factor1, factor2);
+                if (has_four_factors)
+                {
+                    comp->skew(level1, level2, factor1, factor2, factor3, factor4);
+                }
+                else
+                {
+                    comp->skew(level1, level2, factor1, factor2);
+                }
             }
         }
 
@@ -392,13 +446,19 @@ Result schedule_str_to_result(std::string function_name, std::string schedule_st
 
     tiramisu::prepare_schedules_for_legality_checks();
     is_legal &= tiramisu::check_legality_of_function();
+    // Re-verify parallelization on the final schedule: a parallel tag applied
+    // earlier may have been invalidated by a later interchange/tiling.
+    is_legal &= tiramisu::check_legality_of_parallelism();
     result.legality = is_legal;
     implicit_function->gen_time_space_domain();
     implicit_function->gen_isl_ast();
     std::string isl_ast = implicit_function->generate_isl_ast_representation_string(nullptr, 0, "");
     result.isl_ast = isl_ast;
 
-    if (is_legal && operation == Operation::execution)
+    bool should_execute = operation == Operation::execution ||
+                          operation == Operation::execution_no_check;
+    bool legality_required = operation != Operation::execution_no_check;
+    if (should_execute && (is_legal || !legality_required))
     {
         tiramisu::codegen(buffers, function_name + ".o");
 

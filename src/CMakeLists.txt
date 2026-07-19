@@ -1,6 +1,6 @@
 set(INCLUDES
-    ${TIRAMISU_INSTALL}/include/
     ${PROJECT_SOURCE_DIR}/include
+    ${TIRAMISU_INSTALL}/include/
 )
 
 option(USE_SQLITE "Use SQLITE" OFF)
