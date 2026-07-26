@@ -1,5 +1,6 @@
 #include <tiramisu/tiramisu.h>
 #include <TiraLibCPP/utils.h>
+#include <unordered_set>
 // #include "function_floyd_warshall_MINI_wrapper.h"
 
 using namespace tiramisu;
@@ -47,16 +48,21 @@ std::string get_first_comp(std::string comps_str)
 std::vector<tiramisu::computation *> get_comps(std::string comps_str, tiramisu::function *implicit_function)
 {
     std::vector<tiramisu::computation *> comps;
+    std::unordered_set<tiramisu::computation *> seen;
     std::string delimiter = ",";
     size_t pos = 0;
     std::string token;
     while ((pos = comps_str.find(delimiter)) != std::string::npos)
     {
         token = comps_str.substr(0, pos);
-        comps.push_back(get_computation_by_name(token, implicit_function));
+        auto comp = get_computation_by_name(token, implicit_function);
+        if (seen.insert(comp).second)
+            comps.push_back(comp);
         comps_str.erase(0, pos + delimiter.length());
     }
-    comps.push_back(get_computation_by_name(comps_str, implicit_function));
+    auto comp = get_computation_by_name(comps_str, implicit_function);
+    if (seen.insert(comp).second)
+        comps.push_back(comp);
     return comps;
 }
 

@@ -233,6 +233,17 @@ TEST(TiraLibCppTest, DuplicateParallelizationTargetsAreIdempotent)
   EXPECT_EQ(clean_halide_ir(duplicate_ir), clean_halide_ir(unique_ir));
 }
 
+TEST(TiraLibCppTest, DuplicateTilingTargetsAreIdempotent)
+{
+  auto [unique_result, unique_ir] = apply_schedule_blur(
+      "T2(L0,L1,4,4,comps=['comp_blur'])");
+  auto [duplicate_result, duplicate_ir] = apply_schedule_blur(
+      "T2(L0,L1,4,4,comps=['comp_blur','comp_blur','comp_blur'])");
+
+  EXPECT_EQ(duplicate_result.legality, unique_result.legality);
+  EXPECT_EQ(clean_halide_ir(duplicate_ir), clean_halide_ir(unique_ir));
+}
+
 TEST(TiraLibCppTest, Tiling2D)
 {
   std::string schedule = "T2(L0,L1,32,32,comps=['comp_blur'])";
@@ -591,6 +602,7 @@ TEST(TiraLibCppTest, IllegalAction)
   std::string halide_ir = std::get<1>(result);
 
   EXPECT_EQ(resultInstance.legality, false);
+  EXPECT_TRUE(resultInstance.isl_ast.empty());
 }
 
 std::tuple<Result, std::string> apply_schedule_skewing_sample(std::string schedule)
