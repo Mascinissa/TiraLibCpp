@@ -450,10 +450,17 @@ Result schedule_str_to_result(std::string function_name, std::string schedule_st
     // earlier may have been invalidated by a later interchange/tiling.
     is_legal &= tiramisu::check_legality_of_parallelism();
     result.legality = is_legal;
-    implicit_function->gen_time_space_domain();
-    implicit_function->gen_isl_ast();
-    std::string isl_ast = implicit_function->generate_isl_ast_representation_string(nullptr, 0, "");
-    result.isl_ast = isl_ast;
+    // Code-generation AST construction is only valid after the transformed
+    // schedule passes legality.  Besides avoiding work for rejected schedules,
+    // this keeps illegal helper/update domains out of ISL's AST builder.
+    if (is_legal)
+    {
+        implicit_function->gen_time_space_domain();
+        implicit_function->gen_isl_ast();
+        result.isl_ast =
+            implicit_function->generate_isl_ast_representation_string(
+                nullptr, 0, "");
+    }
 
     bool should_execute = operation == Operation::execution ||
                           operation == Operation::execution_no_check;
