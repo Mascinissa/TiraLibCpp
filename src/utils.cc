@@ -78,6 +78,10 @@ Operation get_operation_from_string(std::string operation_str)
         return Operation::execution_no_check;
     else if (operation_str == "legality_noast")
         return Operation::legality_noast;
+    else if (operation_str == "codegen")
+        return Operation::codegen_only;
+    else if (operation_str == "run_obj")
+        return Operation::run_obj;
     else
         assert(false && "Unknown operation");
 }
