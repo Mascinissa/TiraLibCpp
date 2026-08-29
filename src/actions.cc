@@ -3,6 +3,7 @@
 #include <regex>
 #include <unordered_set>
 #include <TiraLibCPP/utils.h>
+#include <TiraLibCPP/actions.h>
 #include <TiraLibCPP/dbhelpers.h>
 
 static void parse_or_throw(const std::string &action_str, std::smatch &match,
@@ -426,7 +427,66 @@ bool apply_actions_from_schedule_str(std::string schedule_str, tiramisu::functio
     return is_legal;
 }
 
-Result schedule_str_to_result(std::string function_name, std::string schedule_str, Operation operation, std::vector<tiramisu::buffer *> buffers)
+// Phase timing markers (stderr), enabled with TIRALIB_TIMING=1. Used to attribute
+// the wall-clock of one server operation to its phases; off by default (zero cost).
+namespace
+{
+struct PhaseTimer
+{
+    bool on;
+    std::chrono::steady_clock::time_point t;
+    PhaseTimer()
+    {
+        const char *e = getenv("TIRALIB_TIMING");
+        on = e && e[0] == '1';
+        t = std::chrono::steady_clock::now();
+    }
+    void mark(const char *phase)
+    {
+        if (!on)
+            return;
+        auto now = std::chrono::steady_clock::now();
+        double ms = std::chrono::duration<double, std::milli>(now - t).count();
+        fprintf(stderr, "TIRALIB_TIMING %s %.3f ms\n", phase, ms);
+        t = now;
+    }
+};
+} // namespace
+
+// Ensure the wrapper binary exists (compiles it on first use) and run it,
+// filling result.success / result.exec_times. The wrapper resolves
+// ./<function_name>.o.so at process start, so whatever .so sits at that path is
+// the kernel that gets timed.
+static void run_wrapper_into_result(const std::string &function_name, Result &result, PhaseTimer &pt)
+{
+    std::string wrapper_cmd = "./" + function_name + "_wrapper";
+    if (!file_exists(function_name + "_wrapper"))
+    {
+// if USE_SQLITE is defined, write the wrapper to a file else raise an error
+#ifdef USE_SQLITE
+        if (write_wrapper_from_db(function_name))
+        {
+            std::cout << "Error: could not write wrapper to file" << std::endl;
+            // exit with error
+            exit(1);
+        };
+#else
+        compile_wrapper(function_name);
+        pt.mark("wrapper_compile");
+#endif
+    }
+    auto res_tuple = exec(wrapper_cmd.c_str());
+    result.success = std::get<0>(res_tuple);
+    result.exec_times = std::get<1>(res_tuple);
+    pt.mark("wrapper_run");
+    // remove new line character
+    if (!result.exec_times.empty() && result.exec_times[result.exec_times.length() - 1] == '\n')
+    {
+        result.exec_times.erase(result.exec_times.length() - 1);
+    }
+}
+
+Result schedule_str_to_result(std::string function_name, std::string schedule_str, Operation operation, std::vector<tiramisu::buffer *> buffers, bool skip_prep, const std::string &obj_tag)
 {
     Result result = {
         .name = function_name,
@@ -436,30 +496,99 @@ Result schedule_str_to_result(std::string function_name, std::string schedule_st
         .success = true,
     };
 
+    PhaseTimer pt;
+
+    // run_obj: no tiramisu work at all — swap the pre-generated tagged .so into
+    // the path the wrapper loads, then run the wrapper. Legality/codegen were
+    // done by earlier legality/codegen_only requests.
+    if (operation == Operation::run_obj)
+    {
+        result.legality = true;
+        std::string tagged = obj_tag + ".o.so";
+        if (!file_exists(tagged))
+        {
+            result.success = false;
+            result.additional_info = "run_obj: missing " + tagged;
+            return result;
+        }
+        std::string cp_cmd = "cp -f " + tagged + " " + function_name + ".o.so";
+        int status = system(cp_cmd.c_str());
+        if (status != 0)
+        {
+            result.success = false;
+            result.additional_info = "run_obj: could not install " + tagged;
+            return result;
+        }
+        pt.mark("install_obj");
+        run_wrapper_into_result(function_name, result, pt);
+        return result;
+    }
+
     auto implicit_function = tiramisu::global::get_implicit_function();
 
-    tiramisu::prepare_schedules_for_legality_checks();
-    tiramisu::perform_full_dependency_analysis();
+    // In serve mode the parent process has already run prepare + full dependency
+    // analysis on the pristine function (they depend only on the un-transformed
+    // program); each forked child inherits that state, so redoing them here would
+    // be pure duplicated work.
+    if (!skip_prep)
+    {
+        tiramisu::prepare_schedules_for_legality_checks();
+        tiramisu::perform_full_dependency_analysis();
+        pt.mark("prepare_and_dependency_analysis");
+    }
     bool is_legal = true;
 
     is_legal &= apply_actions_from_schedule_str(schedule_str, implicit_function, result);
+    pt.mark("apply_actions");
+
+    // execution_no_check is only requested for schedules whose legality was already
+    // established by a preceding "legality" operation (same UCheck serialization —
+    // see FunctionServer.run). The dependence-based re-checks and the explicit
+    // ISL-AST serialization below are pure duplicated work in that case: codegen()
+    // regenerates the time-space domain and the ISL AST itself, and the caller
+    // ignores result.isl_ast / result.legality for execution replays.
+    bool trust_caller_legality = operation == Operation::execution_no_check ||
+                                 operation == Operation::codegen_only;
 
     tiramisu::prepare_schedules_for_legality_checks();
-    is_legal &= tiramisu::check_legality_of_function();
-    // Re-verify parallelization on the final schedule: a parallel tag applied
-    // earlier may have been invalidated by a later interchange/tiling.
-    is_legal &= tiramisu::check_legality_of_parallelism();
+    if (!trust_caller_legality)
+    {
+        is_legal &= tiramisu::check_legality_of_function();
+        // Re-verify parallelization on the final schedule: a parallel tag applied
+        // earlier may have been invalidated by a later interchange/tiling.
+        is_legal &= tiramisu::check_legality_of_parallelism();
+    }
     result.legality = is_legal;
+    pt.mark("legality_checks");
     // Code-generation AST construction is only valid after the transformed
     // schedule passes legality.  Besides avoiding work for rejected schedules,
     // this keeps illegal helper/update domains out of ISL's AST builder.
-    if (is_legal)
+    // legality_noast callers ignore the AST string (no tree update), so skip
+    // the (expensive) generation + serialization for them too.
+    if (is_legal && !trust_caller_legality && operation != Operation::legality_noast)
     {
         implicit_function->gen_time_space_domain();
         implicit_function->gen_isl_ast();
         result.isl_ast =
             implicit_function->generate_isl_ast_representation_string(
                 nullptr, 0, "");
+        pt.mark("isl_ast_generation");
+    }
+
+    // codegen_only: lower + link into a per-request tagged .so; the timed run
+    // happens later via run_obj. This lets several candidates' codegens proceed
+    // in parallel while the timed runs stay strictly serial.
+    if (operation == Operation::codegen_only)
+    {
+        std::string tag = obj_tag.empty() ? function_name : obj_tag;
+        tiramisu::codegen(buffers, tag + ".o");
+        pt.mark("halide_codegen_obj");
+        std::string gcc_cmd = "g++ -shared -o " + tag + ".o.so " + tag + ".o";
+        int status = system(gcc_cmd.c_str());
+        assert(status != 139 && "Segmentation Fault when trying to execute schedule");
+        result.success = (status == 0) && file_exists(tag + ".o.so");
+        pt.mark("link_shared_obj");
+        return result;
     }
 
     bool should_execute = operation == Operation::execution ||
@@ -468,38 +597,16 @@ Result schedule_str_to_result(std::string function_name, std::string schedule_st
     if (should_execute && (is_legal || !legality_required))
     {
         tiramisu::codegen(buffers, function_name + ".o");
+        pt.mark("halide_codegen_obj");
 
         std::string gpp_command = "g++";
-        std::string wrapper_cmd = "./" + function_name + "_wrapper";
 
         std::string gcc_cmd = gpp_command + " -shared -o " + function_name + ".o.so " + function_name + ".o";
         // run the command and retrieve the execution status
         int status = system(gcc_cmd.c_str());
         assert(status != 139 && "Segmentation Fault when trying to execute schedule");
-        // write the wrapper to a file if it does not exist
-        if (!file_exists(function_name + "_wrapper"))
-        {
-// if USE_SQLITE is defined, write the wrapper to a file else raise an error
-#ifdef USE_SQLITE
-            if (write_wrapper_from_db(function_name))
-            {
-                std::cout << "Error: could not write wrapper to file" << std::endl;
-                // exit with error
-                exit(1);
-            };
-#else
-            compile_wrapper(function_name);
-#endif
-        }
-        // run the wrapper
-        auto res_tuple = exec(wrapper_cmd.c_str());
-        result.success = std::get<0>(res_tuple);
-        result.exec_times = std::get<1>(res_tuple);
-        // remove new line character
-        if (!result.exec_times.empty() && result.exec_times[result.exec_times.length() - 1] == '\n')
-        {
-            result.exec_times.erase(result.exec_times.length() - 1);
-        }
+        pt.mark("link_shared_obj");
+        run_wrapper_into_result(function_name, result, pt);
     }
     return result;
 }
@@ -516,4 +623,139 @@ void schedule_str_to_result_str(std::string function_name, std::string schedule_
 
     auto result = schedule_str_to_result(function_name, schedule_str, operation, buffers);
     std::cout << serialize_result(result) << std::endl;
+}
+
+// ---------------------------------------------------------------------------
+// Persistent fork-server ("serve" mode)
+//
+// Request protocol: one request per stdin line,
+//   <op> \t <min_runs> \t <max_runs> \t <time_budget> \t <obj_tag> \t <schedule_str>
+// where <op> in {legality, legality_noast, execution_no_check, codegen, run_obj,
+// prepare_wrapper, annotations, exit}. The parent forks a child per request; the
+// child performs the operation (inheriting the already-done function construction
+// + dependency analysis), prints the result JSON followed by a DONE sentinel and
+// exits. A crashed child (assert/segfault on a pathological schedule) only loses
+// that request: the parent notices via waitpid and emits a FAIL sentinel.
+// ---------------------------------------------------------------------------
+#include <sys/wait.h>
+#include <unistd.h>
+
+static std::vector<std::string> split_tabs(const std::string &line, size_t max_fields)
+{
+    std::vector<std::string> out;
+    size_t start = 0;
+    while (out.size() + 1 < max_fields)
+    {
+        size_t pos = line.find('\t', start);
+        if (pos == std::string::npos)
+            break;
+        out.push_back(line.substr(start, pos - start));
+        start = pos + 1;
+    }
+    out.push_back(line.substr(start));
+    return out;
+}
+
+int run_server_loop(std::string function_name, std::vector<tiramisu::buffer *> buffers)
+{
+    // One-time preparation, inherited (copy-on-write) by every forked child.
+    // Both depend only on the un-transformed function, exactly as when every
+    // operation ran them in its own fresh process.
+    tiramisu::prepare_schedules_for_legality_checks();
+    tiramisu::perform_full_dependency_analysis();
+
+    std::cout << "###TIRALIB_SERVE_READY###" << std::endl;
+
+    std::string line;
+    while (std::getline(std::cin, line))
+    {
+        if (line.empty())
+            continue;
+        if (line == "exit")
+            break;
+        auto fields = split_tabs(line, 6);
+        if (fields.size() != 6)
+        {
+            std::cout << "###TIRALIB_SERVE_FAIL bad_request###" << std::endl;
+            continue;
+        }
+        const std::string &op = fields[0];
+        const std::string &min_runs = fields[1];
+        const std::string &max_runs = fields[2];
+        const std::string &time_budget = fields[3];
+        const std::string &obj_tag = fields[4];
+        const std::string &sched = fields[5];
+
+        std::cout.flush();
+        fflush(nullptr);
+        pid_t pid = fork();
+        if (pid == 0)
+        {
+            // child
+            setenv("MIN_RUNS", min_runs.c_str(), 1);
+            setenv("MAX_RUNS", max_runs.c_str(), 1);
+            setenv("TIME_BUDGET", time_budget.c_str(), 1);
+            if (op == "annotations")
+            {
+                auto ast = tiramisu::auto_scheduler::syntax_tree(tiramisu::global::get_implicit_function(), {});
+                std::cout << tiramisu::auto_scheduler::evaluate_by_learning_model::get_program_json(ast) << std::endl;
+            }
+            else if (op == "prepare_wrapper")
+            {
+                // Compile the wrapper binary ahead of the timed-run phase (it
+                // links ./<function_name>.o.so, so any candidate's .so works —
+                // install the tagged one if the canonical path is missing).
+                Result result = {.name = function_name, .legality = true, .isl_ast = "",
+                                 .exec_times = "", .additional_info = "", .success = true};
+                if (!file_exists(function_name + "_wrapper"))
+                {
+                    if (!file_exists(function_name + ".o.so") && !obj_tag.empty() &&
+                        file_exists(obj_tag + ".o.so"))
+                    {
+                        std::string cp_cmd = "cp -f " + obj_tag + ".o.so " + function_name + ".o.so";
+                        result.success = system(cp_cmd.c_str()) == 0;
+                    }
+                    if (result.success && file_exists(function_name + ".o.so"))
+                        compile_wrapper(function_name);
+                    result.success = file_exists(function_name + "_wrapper");
+                }
+                std::cout << serialize_result(result) << std::endl;
+            }
+            else
+            {
+                Operation operation;
+                if (op == "legality")
+                    operation = Operation::legality;
+                else if (op == "legality_noast")
+                    operation = Operation::legality_noast;
+                else if (op == "execution_no_check" || op == "execution")
+                    operation = Operation::execution_no_check;
+                else if (op == "codegen")
+                    operation = Operation::codegen_only;
+                else if (op == "run_obj")
+                    operation = Operation::run_obj;
+                else
+                {
+                    std::cout << "###TIRALIB_SERVE_FAIL unknown_op###" << std::endl;
+                    std::cout.flush();
+                    _exit(0);
+                }
+                auto result = schedule_str_to_result(function_name, sched, operation, buffers,
+                                                     /*skip_prep=*/true, obj_tag);
+                std::cout << serialize_result(result) << std::endl;
+            }
+            std::cout << "###TIRALIB_SERVE_DONE###" << std::endl;
+            std::cout.flush();
+            fflush(nullptr);
+            _exit(0);
+        }
+        int status = 0;
+        waitpid(pid, &status, 0);
+        if (status != 0)
+        {
+            // the child died before printing its sentinel: unblock the client
+            std::cout << "\n###TIRALIB_SERVE_FAIL child_status_" << status << "###" << std::endl;
+        }
+    }
+    return 0;
 }

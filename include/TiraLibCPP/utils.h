@@ -19,6 +19,17 @@ enum Operation
     annotations = 2,
     skewing_solver = 3,
     execution_no_check = 4,
+    // legality verdict without generating/serializing the ISL AST — for callers
+    // that only need the boolean (e.g. legality-filtering a candidate list)
+    legality_noast = 5,
+    // apply + codegen + link into a per-request tagged .so; no wrapper run.
+    // Lets several candidates' codegens proceed in parallel while the timed
+    // runs stay strictly serial (see run_obj).
+    codegen_only = 6,
+    // swap a previously codegen'd tagged .so into place and run the wrapper;
+    // no tiramisu/ISL/Halide work at all — this is the only piece that should
+    // ever run during timing.
+    run_obj = 7,
 };
 
 struct Result
