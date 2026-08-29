@@ -452,6 +452,39 @@ struct PhaseTimer
 };
 } // namespace
 
+// Ensure the wrapper binary exists (compiles it on first use) and run it,
+// filling result.success / result.exec_times. The wrapper resolves
+// ./<function_name>.o.so at process start, so whatever .so sits at that path is
+// the kernel that gets timed.
+static void run_wrapper_into_result(const std::string &function_name, Result &result, PhaseTimer &pt)
+{
+    std::string wrapper_cmd = "./" + function_name + "_wrapper";
+    if (!file_exists(function_name + "_wrapper"))
+    {
+// if USE_SQLITE is defined, write the wrapper to a file else raise an error
+#ifdef USE_SQLITE
+        if (write_wrapper_from_db(function_name))
+        {
+            std::cout << "Error: could not write wrapper to file" << std::endl;
+            // exit with error
+            exit(1);
+        };
+#else
+        compile_wrapper(function_name);
+        pt.mark("wrapper_compile");
+#endif
+    }
+    auto res_tuple = exec(wrapper_cmd.c_str());
+    result.success = std::get<0>(res_tuple);
+    result.exec_times = std::get<1>(res_tuple);
+    pt.mark("wrapper_run");
+    // remove new line character
+    if (!result.exec_times.empty() && result.exec_times[result.exec_times.length() - 1] == '\n')
+    {
+        result.exec_times.erase(result.exec_times.length() - 1);
+    }
+}
+
 Result schedule_str_to_result(std::string function_name, std::string schedule_str, Operation operation, std::vector<tiramisu::buffer *> buffers)
 {
     Result result = {
@@ -473,17 +506,28 @@ Result schedule_str_to_result(std::string function_name, std::string schedule_st
     is_legal &= apply_actions_from_schedule_str(schedule_str, implicit_function, result);
     pt.mark("apply_actions");
 
+    // execution_no_check is only requested for schedules whose legality was already
+    // established by a preceding "legality" operation (same UCheck serialization —
+    // see FunctionServer.run). The dependence-based re-checks and the explicit
+    // ISL-AST serialization below are pure duplicated work in that case: codegen()
+    // regenerates the time-space domain and the ISL AST itself, and the caller
+    // ignores result.isl_ast / result.legality for execution replays.
+    bool trust_caller_legality = operation == Operation::execution_no_check;
+
     tiramisu::prepare_schedules_for_legality_checks();
-    is_legal &= tiramisu::check_legality_of_function();
-    // Re-verify parallelization on the final schedule: a parallel tag applied
-    // earlier may have been invalidated by a later interchange/tiling.
-    is_legal &= tiramisu::check_legality_of_parallelism();
+    if (!trust_caller_legality)
+    {
+        is_legal &= tiramisu::check_legality_of_function();
+        // Re-verify parallelization on the final schedule: a parallel tag applied
+        // earlier may have been invalidated by a later interchange/tiling.
+        is_legal &= tiramisu::check_legality_of_parallelism();
+    }
     result.legality = is_legal;
     pt.mark("legality_checks");
     // Code-generation AST construction is only valid after the transformed
     // schedule passes legality.  Besides avoiding work for rejected schedules,
     // this keeps illegal helper/update domains out of ISL's AST builder.
-    if (is_legal)
+    if (is_legal && !trust_caller_legality)
     {
         implicit_function->gen_time_space_domain();
         implicit_function->gen_isl_ast();
@@ -502,39 +546,13 @@ Result schedule_str_to_result(std::string function_name, std::string schedule_st
         pt.mark("halide_codegen_obj");
 
         std::string gpp_command = "g++";
-        std::string wrapper_cmd = "./" + function_name + "_wrapper";
 
         std::string gcc_cmd = gpp_command + " -shared -o " + function_name + ".o.so " + function_name + ".o";
         // run the command and retrieve the execution status
         int status = system(gcc_cmd.c_str());
         assert(status != 139 && "Segmentation Fault when trying to execute schedule");
         pt.mark("link_shared_obj");
-        // write the wrapper to a file if it does not exist
-        if (!file_exists(function_name + "_wrapper"))
-        {
-// if USE_SQLITE is defined, write the wrapper to a file else raise an error
-#ifdef USE_SQLITE
-            if (write_wrapper_from_db(function_name))
-            {
-                std::cout << "Error: could not write wrapper to file" << std::endl;
-                // exit with error
-                exit(1);
-            };
-#else
-            compile_wrapper(function_name);
-            pt.mark("wrapper_compile");
-#endif
-        }
-        // run the wrapper
-        auto res_tuple = exec(wrapper_cmd.c_str());
-        result.success = std::get<0>(res_tuple);
-        result.exec_times = std::get<1>(res_tuple);
-        pt.mark("wrapper_run");
-        // remove new line character
-        if (!result.exec_times.empty() && result.exec_times[result.exec_times.length() - 1] == '\n')
-        {
-            result.exec_times.erase(result.exec_times.length() - 1);
-        }
+        run_wrapper_into_result(function_name, result, pt);
     }
     return result;
 }
