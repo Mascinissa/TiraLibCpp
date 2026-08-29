@@ -426,6 +426,32 @@ bool apply_actions_from_schedule_str(std::string schedule_str, tiramisu::functio
     return is_legal;
 }
 
+// Phase timing markers (stderr), enabled with TIRALIB_TIMING=1. Used to attribute
+// the wall-clock of one server operation to its phases; off by default (zero cost).
+namespace
+{
+struct PhaseTimer
+{
+    bool on;
+    std::chrono::steady_clock::time_point t;
+    PhaseTimer()
+    {
+        const char *e = getenv("TIRALIB_TIMING");
+        on = e && e[0] == '1';
+        t = std::chrono::steady_clock::now();
+    }
+    void mark(const char *phase)
+    {
+        if (!on)
+            return;
+        auto now = std::chrono::steady_clock::now();
+        double ms = std::chrono::duration<double, std::milli>(now - t).count();
+        fprintf(stderr, "TIRALIB_TIMING %s %.3f ms\n", phase, ms);
+        t = now;
+    }
+};
+} // namespace
+
 Result schedule_str_to_result(std::string function_name, std::string schedule_str, Operation operation, std::vector<tiramisu::buffer *> buffers)
 {
     Result result = {
@@ -436,13 +462,16 @@ Result schedule_str_to_result(std::string function_name, std::string schedule_st
         .success = true,
     };
 
+    PhaseTimer pt;
     auto implicit_function = tiramisu::global::get_implicit_function();
 
     tiramisu::prepare_schedules_for_legality_checks();
     tiramisu::perform_full_dependency_analysis();
+    pt.mark("prepare_and_dependency_analysis");
     bool is_legal = true;
 
     is_legal &= apply_actions_from_schedule_str(schedule_str, implicit_function, result);
+    pt.mark("apply_actions");
 
     tiramisu::prepare_schedules_for_legality_checks();
     is_legal &= tiramisu::check_legality_of_function();
@@ -450,6 +479,7 @@ Result schedule_str_to_result(std::string function_name, std::string schedule_st
     // earlier may have been invalidated by a later interchange/tiling.
     is_legal &= tiramisu::check_legality_of_parallelism();
     result.legality = is_legal;
+    pt.mark("legality_checks");
     // Code-generation AST construction is only valid after the transformed
     // schedule passes legality.  Besides avoiding work for rejected schedules,
     // this keeps illegal helper/update domains out of ISL's AST builder.
@@ -460,6 +490,7 @@ Result schedule_str_to_result(std::string function_name, std::string schedule_st
         result.isl_ast =
             implicit_function->generate_isl_ast_representation_string(
                 nullptr, 0, "");
+        pt.mark("isl_ast_generation");
     }
 
     bool should_execute = operation == Operation::execution ||
@@ -468,6 +499,7 @@ Result schedule_str_to_result(std::string function_name, std::string schedule_st
     if (should_execute && (is_legal || !legality_required))
     {
         tiramisu::codegen(buffers, function_name + ".o");
+        pt.mark("halide_codegen_obj");
 
         std::string gpp_command = "g++";
         std::string wrapper_cmd = "./" + function_name + "_wrapper";
@@ -476,6 +508,7 @@ Result schedule_str_to_result(std::string function_name, std::string schedule_st
         // run the command and retrieve the execution status
         int status = system(gcc_cmd.c_str());
         assert(status != 139 && "Segmentation Fault when trying to execute schedule");
+        pt.mark("link_shared_obj");
         // write the wrapper to a file if it does not exist
         if (!file_exists(function_name + "_wrapper"))
         {
@@ -489,12 +522,14 @@ Result schedule_str_to_result(std::string function_name, std::string schedule_st
             };
 #else
             compile_wrapper(function_name);
+            pt.mark("wrapper_compile");
 #endif
         }
         // run the wrapper
         auto res_tuple = exec(wrapper_cmd.c_str());
         result.success = std::get<0>(res_tuple);
         result.exec_times = std::get<1>(res_tuple);
+        pt.mark("wrapper_run");
         // remove new line character
         if (!result.exec_times.empty() && result.exec_times[result.exec_times.length() - 1] == '\n')
         {
