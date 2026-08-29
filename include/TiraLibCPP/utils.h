@@ -19,6 +19,9 @@ enum Operation
     annotations = 2,
     skewing_solver = 3,
     execution_no_check = 4,
+    // legality verdict without generating/serializing the ISL AST — for callers
+    // that only need the boolean (e.g. legality-filtering a candidate list)
+    legality_noast = 5,
 };
 
 struct Result

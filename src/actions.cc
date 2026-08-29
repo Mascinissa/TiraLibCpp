@@ -527,7 +527,9 @@ Result schedule_str_to_result(std::string function_name, std::string schedule_st
     // Code-generation AST construction is only valid after the transformed
     // schedule passes legality.  Besides avoiding work for rejected schedules,
     // this keeps illegal helper/update domains out of ISL's AST builder.
-    if (is_legal && !trust_caller_legality)
+    // legality_noast callers ignore the AST string (no tree update), so skip
+    // the (expensive) generation + serialization for them too.
+    if (is_legal && !trust_caller_legality && operation != Operation::legality_noast)
     {
         implicit_function->gen_time_space_domain();
         implicit_function->gen_isl_ast();

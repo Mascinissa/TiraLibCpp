@@ -76,6 +76,8 @@ Operation get_operation_from_string(std::string operation_str)
         return Operation::annotations;
     else if (operation_str == "execution_no_check")
         return Operation::execution_no_check;
+    else if (operation_str == "legality_noast")
+        return Operation::legality_noast;
     else
         assert(false && "Unknown operation");
 }
